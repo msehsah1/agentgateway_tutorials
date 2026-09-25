@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# Exposes Playwright MCP and self-hosted Firecrawl MCP through Agentgateway:
+#   UI:              http://localhost:4000/ui
+#   Federated MCP:   http://localhost:4000/mcp
+config:
+  # Prefer IPv4 for Compose DNS (playwright-mcp, firecrawl-mcp, otel-collector).
+  enableIpv6: false
+  database:
+    url: sqlite:///data/data.db
+  backend:
+    connectTimeout: 5s
+  # MCP observability: export traces to the Compose OpenTelemetry collector.
+  # https://agentgateway.dev/docs/standalone/latest/documentation/mcp/mcp-observability/
+  tracing:
+    otlpEndpoint: http://otel-collector:4317
+    otlpProtocol: grpc
+    randomSampling: true
+    clientSampling: true
+
+gateways:
+  default:
+    port: 4000
+
+mcp:
+  statefulMode: stateful
+  # Tool names already differ (browser_* vs firecrawl_*), so do not re-prefix.
+  prefixMode: never
+  # Keep Playwright available if Firecrawl is still starting.
+  failureMode: failOpen
+  policies:
+    cors:
+      allowOrigins:
+        - "*"
+      allowHeaders:
+        - "*"
+      exposeHeaders:
+        - "Mcp-Session-Id"
+  targets:
+    - name: playwright
+      mcp:
+        host: http://playwright-mcp:8931/mcp
+    - name: firecrawl
+      mcp:
+        host: http://firecrawl-mcp:3000/mcp
+
+# Access-log enrichment from the MCP observability guide. No method filter so
+# initialize, tools/list, and tools/call all still appear on stdout and Loki.
+# OTLP export: https://agentgateway.dev/docs/standalone/latest/documentation/observability/access-logs/export/
+# Tracing stays under config.tracing: v1.5.0 rejects using that together with
+# frontendPolicies.tracing.
+frontendPolicies:
+  accessLog:
+    add:
+      tool_args: "mcp.tool.arguments"
+      tool_result: "mcp.tool.result"
+      tool_error: "mcp.tool.error"
+    otlp:
+      host: otel-collector:4317
+      protocol: grpc
+
+ui:
+  gateways: default

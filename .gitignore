@@ -1,0 +1,7 @@
+# Local SQLite file written by Agentgateway
+agentgateway/data/*
+!agentgateway/data/.gitkeep
+*.db
+
+# Firecrawl local secrets (copy from .env.example)
+.env
