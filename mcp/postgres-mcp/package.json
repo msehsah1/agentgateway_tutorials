@@ -1,0 +1,16 @@
+{
+  "name": "postgres-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Streamable HTTP MCP server for the demo Postgres store",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "express": "^4.21.2",
+    "pg": "^8.16.3",
+    "zod": "^3.25.76"
+  }
+}

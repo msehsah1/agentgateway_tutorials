@@ -1,0 +1,277 @@
+# Agentgateway + seeded Postgres MCP
+#
+# Clients reach MCP only through Agentgateway at http://127.0.0.1:4000/mcp
+# (Keycloak JWT). The same policy applies at http://127.0.0.1:4000/postgres/mcp.
+# Host publishes bind 127.0.0.1 only.
+#
+# Config lives next to each concern; this file is the only Compose project:
+#   agentgateway/   config.yaml and SQLite data/
+#   mcp/            Postgres MCP image
+#   postgres/       schema, seed, and provision script
+#   observability/  collector, Prometheus, Loki, Grafana
+#   keycloak/       realm provision script (kcadm)
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-store}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-store}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Re-applies schema + seed on every compose up (idempotent DROP/CREATE).
+  # First boot also runs the same SQL via /docker-entrypoint-initdb.d.
+  postgres-provision:
+    image: postgres:16
+    container_name: postgres-provision
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-store}
+    volumes:
+      - ./postgres/provision-demo-db.sh:/scripts/provision-demo-db.sh:ro
+      - ./postgres/init:/scripts/init:ro
+    entrypoint: ["/bin/bash", "/scripts/provision-demo-db.sh"]
+
+  postgres-mcp:
+    build:
+      context: ./mcp/postgres-mcp
+      dockerfile: Dockerfile
+    image: postgres-mcp:local
+    container_name: postgres-mcp
+    restart: unless-stopped
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      PGHOST: postgres
+      PGPORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-store}
+    expose:
+      - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-provision:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # MCP observability backend from
+  # https://agentgateway.dev/docs/standalone/latest/documentation/mcp/mcp-observability/
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"
+      - "127.0.0.1:14268:14268"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.146.0
+    container_name: otel-collector
+    restart: unless-stopped
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+    depends_on:
+      - jaeger
+      - loki
+
+  # Loki + Grafana: official user-facing destination for OTLP access logs.
+  # https://agentgateway.dev/docs/standalone/latest/documentation/observability/access-logs/export/
+  # https://grafana.com/docs/loki/latest/setup/install/docker/
+  loki:
+    image: grafana/loki:3.7.0
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./observability/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    ports:
+      - "127.0.0.1:3100:3100"
+
+  grafana:
+    image: grafana/grafana:11.6.3
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: light
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - loki
+      - prometheus
+
+  # Prometheus scrape of Agentgateway /metrics on the Compose service name.
+  # https://agentgateway.dev/docs/standalone/latest/documentation/observability/metrics/prometheus/
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      agentgateway:
+        condition: service_started
+
+  # Official Keycloak image in development mode (embedded DB, not for production).
+  # https://www.keycloak.org/server/containers
+  # https://agentgateway.dev/docs/standalone/latest/integrations/auth/keycloak/
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.1
+    container_name: keycloak
+    restart: unless-stopped
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Browser-facing URL for the Admin Console (http://localhost:8080).
+      # The console's 3rd-party-cookie iframe is loaded from this origin.
+      # Do not set this to the Compose service name, and do not split
+      # hostname-admin onto a different origin: the host cannot resolve
+      # `keycloak`, and the iframe then times out with
+      # "Timeout when waiting for 3rd party check iframe message."
+      # MCP login, tokens, and discovery also use this URL so a browser on
+      # the host can complete OAuth without a /etc/hosts entry for `keycloak`.
+      KC_HOSTNAME: http://localhost:8080
+      # start-dev already relaxes this; keep it explicit so Host: keycloak:8080
+      # (provision, Agentgateway JWKS) is accepted while URLs stay localhost.
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    expose:
+      - "8080"
+      - "9000"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 45s
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Runs official kcadm steps (realm, pre-registered public client, audience
+  # mapper, users). Re-run after recreating Keycloak:
+  #   docker compose up --force-recreate keycloak keycloak-provision
+  keycloak-provision:
+    image: quay.io/keycloak/keycloak:26.7.1
+    container_name: keycloak-provision
+    restart: "no"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./keycloak/provision-mcp-realm.sh:/provision-mcp-realm.sh:ro
+    entrypoint: ["/bin/bash", "/provision-mcp-realm.sh"]
+
+  agentgateway:
+    image: cr.agentgateway.dev/agentgateway:v1.5.0
+    container_name: agentgateway
+    restart: unless-stopped
+    user: "${AGW_UID:-1000}:${AGW_GID:-1000}"
+    volumes:
+      - ./agentgateway/config.yaml:/config.yaml
+      - ./agentgateway/data:/data
+    command: ["-f", "/config.yaml"]
+    ports:
+      - "127.0.0.1:4000:4000"
+      - "127.0.0.1:15020:15020"
+    depends_on:
+      postgres-mcp:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
+      keycloak-provision:
+        condition: service_completed_successfully
+
+  # Agentgateway's issuer is http://localhost:8080, but inside its container
+  # that address is the gateway itself. Share the gateway network namespace
+  # and forward loopback :8080 to Keycloak so OIDC discovery works.
+  agentgateway-keycloak-loopback:
+    image: alpine/socat:1.8.0.1
+    container_name: agentgateway-keycloak-loopback
+    restart: unless-stopped
+    network_mode: "service:agentgateway"
+    depends_on:
+      agentgateway:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
+    command:
+      [
+        "TCP4-LISTEN:8080,fork,reuseaddr",
+        "TCP4:keycloak:8080",
+      ]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres-data:

@@ -1,0 +1,10 @@
+# Local SQLite file written by Agentgateway
+agentgateway/data/*
+!agentgateway/data/.gitkeep
+*.db
+
+# Local secrets (copy from .env.example)
+.env
+
+# Postgres MCP image build
+mcp/postgres-mcp/node_modules
